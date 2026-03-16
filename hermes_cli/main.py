@@ -2123,6 +2123,43 @@ def _restore_stashed_changes(
     return True
 
 
+def _get_update_target(git_cmd: list[str]) -> tuple[str, str, str, str]:
+    """Resolve the current branch and the remote/branch it should update from.
+
+    Returns ``(branch, remote, remote_branch, upstream_ref)`` where
+    *upstream_ref* is ``remote/remote_branch``.  When the branch has a
+    configured upstream (e.g. tracking a fork remote), that upstream is
+    used; otherwise falls back to ``origin/<branch>``.
+    """
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    branch = result.stdout.strip()
+    if branch == "HEAD":
+        raise RuntimeError("Cannot update from a detached HEAD; check out a branch first.")
+
+    remote = "origin"
+    remote_branch = branch
+    upstream_ref = f"{remote}/{remote_branch}"
+
+    upstream = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    upstream_name = upstream.stdout.strip()
+    if upstream.returncode == 0 and upstream_name and "/" in upstream_name:
+        remote, remote_branch = upstream_name.split("/", 1)
+        upstream_ref = upstream_name
+
+    return branch, remote, remote_branch, upstream_ref
+
 
 def cmd_update(args):
     """Update Hermes Agent to the latest version."""
@@ -2164,29 +2201,21 @@ def cmd_update(args):
         if sys.platform == "win32":
             git_cmd = ["git", "-c", "windows.appendAtomically=false"]
         
-        subprocess.run(git_cmd + ["fetch", "origin"], cwd=PROJECT_ROOT, check=True)
-        
-        # Get current branch
-        result = subprocess.run(
-            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        branch = result.stdout.strip()
+        branch, remote, remote_branch, upstream_ref = _get_update_target(git_cmd)
+        subprocess.run(git_cmd + ["fetch", remote], cwd=PROJECT_ROOT, check=True)
 
-        # Fall back to main if the current branch doesn't exist on the remote
+        # Fall back to main if the resolved branch doesn't exist on the remote
         verify = subprocess.run(
-            git_cmd + ["rev-parse", "--verify", f"origin/{branch}"],
+            git_cmd + ["rev-parse", "--verify", upstream_ref],
             cwd=PROJECT_ROOT, capture_output=True, text=True,
         )
         if verify.returncode != 0:
-            branch = "main"
+            remote, remote_branch, upstream_ref = "origin", "main", "origin/main"
+            subprocess.run(git_cmd + ["fetch", remote], cwd=PROJECT_ROOT, check=True)
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{upstream_ref}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -2205,7 +2234,7 @@ def cmd_update(args):
 
         print("→ Pulling updates...")
         try:
-            subprocess.run(git_cmd + ["pull", "origin", branch], cwd=PROJECT_ROOT, check=True)
+            subprocess.run(git_cmd + ["pull", remote, remote_branch], cwd=PROJECT_ROOT, check=True)
         finally:
             if auto_stash_ref is not None:
                 _restore_stashed_changes(
