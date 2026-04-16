@@ -1,13 +1,17 @@
 # nix/devShell.nix — Fast dev shell with stamp-file optimization
 { inputs, ... }: {
-  perSystem = { pkgs, ... }:
+  perSystem = { pkgs, system, ... }:
     let
       python = pkgs.python311;
+      # llm-agents.nix packages — available on x86_64-linux
+      llmAgentPackages = if system == "x86_64-linux" then
+        (import inputs.llm-agents-nix { inherit inputs; }).packages.${system}
+      else {};
     in {
       devShells.default = pkgs.mkShell {
         packages = with pkgs; [
           python uv nodejs_20 ripgrep git openssh ffmpeg
-        ];
+        ] ++ (llmAgentPackages or []);
 
         shellHook = ''
           echo "Hermes Agent dev shell"

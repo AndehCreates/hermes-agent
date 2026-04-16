@@ -19,6 +19,12 @@
       url = "github:pyproject-nix/build-system-pkgs";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # llm-agents.nix — Nix packages for AI coding agents (claude-code, opencode, codex, etc.)
+    llm-agents-nix = {
+      url = "github:numtide/llm-agents.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.systems.follows = "flake-parts";
+    };
   };
 
   outputs = inputs:
