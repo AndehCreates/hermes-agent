@@ -4337,14 +4337,21 @@ class HermesCLI:
         _cprint(f"  Branch session:   {new_session_id}")
 
     def save_conversation(self):
-        """Save the current conversation to a file."""
+        """Save the current conversation to a file.
+
+        Conversations are stored under ``HERMES_HOME/sessions/`` so they do
+        not depend on the caller's current working directory. This keeps saves
+        out of vault roots, repos, and other incidental launch locations.
+        """
         if not self.conversation_history:
             print("(;_;) No conversation to save.")
             return
-        
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"hermes_conversation_{timestamp}.json"
-        
+        sessions_dir = get_hermes_home() / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        filename = sessions_dir / f"hermes_conversation_{timestamp}.json"
+
         try:
             with open(filename, "w", encoding="utf-8") as f:
                 json.dump({

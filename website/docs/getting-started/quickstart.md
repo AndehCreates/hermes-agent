@@ -108,7 +108,7 @@ Type `/` to see an autocomplete dropdown of all commands:
 | `/tools` | List available tools |
 | `/model` | Switch models interactively |
 | `/personality pirate` | Try a fun personality |
-| `/save` | Save the conversation |
+| `/save` | Save the conversation to `HERMES_HOME/sessions/` |
 
 ### Multi-line input
 

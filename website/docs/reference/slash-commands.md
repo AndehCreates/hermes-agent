@@ -24,7 +24,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/new` (alias: `/reset`) | Start a new session (fresh session ID + history) |
 | `/clear` | Clear screen and start a new session |
 | `/history` | Show conversation history |
-| `/save` | Save the current conversation |
+|| `/save` | Save the current conversation to `HERMES_HOME/sessions/` |
 | `/retry` | Retry the last message (resend to agent) |
 | `/undo` | Remove the last user/assistant exchange |
 | `/title` | Set a title for the current session (usage: /title My Session Name) |
