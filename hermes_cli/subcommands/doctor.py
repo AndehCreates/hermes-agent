@@ -20,6 +20,17 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
         description="Diagnose issues with Hermes Agent setup",
     )
     doctor_parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=("ops",),
+        help="Optional focused diagnostic mode. Use `ops` for a fast local operational smoke test.",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON for focused diagnostic modes such as `ops`.",
+    )
+    doctor_parser.add_argument(
         "--fix", action="store_true", help="Attempt to fix issues automatically"
     )
     doctor_parser.add_argument(

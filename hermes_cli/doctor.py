@@ -510,6 +510,11 @@ def managed_scope_check() -> None:
 
 def run_doctor(args):
     """Run diagnostic checks."""
+    if getattr(args, "mode", None) == "ops":
+        from hermes_cli.ops_doctor import run_ops_doctor
+
+        sys.exit(run_ops_doctor(args))
+
     should_fix = getattr(args, 'fix', False)
     ack_target = getattr(args, 'ack', None)
 
