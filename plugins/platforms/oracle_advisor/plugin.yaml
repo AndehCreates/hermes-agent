@@ -1,0 +1,3 @@
+name: oracle_advisor
+version: "0.1.0"
+description: Source-only Oracle advisor event transport for Hermes
