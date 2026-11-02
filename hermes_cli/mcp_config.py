@@ -413,7 +413,8 @@ def _resolve_mcp_server_config(config: dict) -> dict:
 
 
 def _probe_single_server(
-    name: str, config: dict, connect_timeout: Optional[float] = None, *, details: Optional[dict] = None
+    name: str, config: dict, connect_timeout: Optional[float] = None, *, details: Optional[dict] = None,
+    auth_probe: Optional[dict] = None,
 ) -> list[tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
 
@@ -432,6 +433,29 @@ def _probe_single_server(
     from tools.mcp_tool_common import _parse_boolish
 
     config = _resolve_mcp_server_config(config)
+    if auth_probe is not None:
+        if (not isinstance(auth_probe, dict) or set(auth_probe) != {"tool", "arguments", "origin"}
+                or not isinstance(auth_probe["tool"], str) or not auth_probe["tool"]
+                or not isinstance(auth_probe["arguments"], dict)):
+            raise ValueError("auth_probe requires an explicitly configured read-only tool and arguments")
+        from urllib.parse import urlsplit
+        target = urlsplit(str(config.get("url") or ""))
+        expected = urlsplit(str(auth_probe["origin"]))
+        try:
+            valid = (target.scheme == expected.scheme == "https" and target.hostname and expected.hostname
+                     and target.username is None and target.password is None
+                     and expected.username is None and expected.password is None
+                     and not expected.path and not expected.query and not expected.fragment
+                     and (target.hostname, target.port or 443) == (expected.hostname, expected.port or 443))
+        except ValueError:
+            valid = False
+        verify = config.get("ssl_verify", True)
+        if (not valid or config.get("auth") != "oauth" or config.get("transport") == "sse"
+                or config.get("client_cert") or not (verify is True or isinstance(verify, str) and verify)):
+            raise ValueError("auth_probe requires verified TLS, its approved HTTPS origin, and native streamable HTTP")
+        config["_auth_probe_no_redirect"] = True
+        config["skip_preflight"] = True
+        config["_auth_probe_spec"] = auth_probe
     if connect_timeout is None:
         try:
             connect_timeout = max(1.0, float(config.get("connect_timeout", 30)))
@@ -451,6 +475,32 @@ def _probe_single_server(
     async def _probe():
         from tools import mcp_tool as _core
 
+        if auth_probe is not None:
+            # An anonymous control establishes that this exact read is protected; a bearer
+            # header alone does not prove that the server required or accepted a grant.
+            anonymous_config = {"url": config["url"], "auth": "", "connect_timeout": connect_timeout,
+                                "ssl_verify": config.get("ssl_verify", True), "skip_preflight": True,
+                                "_auth_probe_no_redirect": True, "_auth_probe_anonymous": True,
+                                "_auth_probe_spec": auth_probe}
+            anonymous = await asyncio.wait_for(_connect_server(name, anonymous_config), timeout=connect_timeout)
+            try:
+                matching = [t for t in anonymous._tools if t.name == auth_probe["tool"]]
+                annotations = getattr(matching[0], "annotations", None) if len(matching) == 1 else None
+                if not annotations or getattr(annotations, "read_only_hint", None) is not True:
+                    raise ValueError("auth_probe tool must advertise readOnlyHint")
+                try:
+                    await asyncio.wait_for(anonymous.session.call_tool(auth_probe["tool"], auth_probe["arguments"]),
+                                           timeout=connect_timeout)
+                except Exception:
+                    pass  # only the matching HTTP 401 evidence below is accepted
+                if not getattr(anonymous, "_auth_probe_challenged", False):
+                    raise RuntimeError("auth_probe anonymous control did not receive a bearer challenge")
+                anonymous_url = getattr(anonymous, "_auth_probe_effective_url", None)
+            finally:
+                await anonymous.shutdown()
+            if not anonymous_url:
+                raise RuntimeError("auth_probe anonymous endpoint was not attested")
+            config["_auth_probe_expected_url"] = anonymous_url
         claimed = []
         claim_token = _core._connect_server_claim.set(claimed.append)
         if details is not None:
@@ -468,6 +518,19 @@ def _probe_single_server(
             if details is not None and claimed:
                 details["initialized"] = claimed[0].initialize_result is not None
         try:
+            if auth_probe is not None:
+                if not anonymous_url or getattr(server, "_auth_probe_effective_url", None) != anonymous_url:
+                    raise RuntimeError("auth_probe effective endpoint changed after anonymous control")
+                matching = [t for t in server._tools if t.name == auth_probe["tool"]]
+                annotations = getattr(matching[0], "annotations", None) if len(matching) == 1 else None
+                if not annotations or getattr(annotations, "read_only_hint", None) is not True:
+                    raise ValueError("auth_probe tool must advertise readOnlyHint")
+                result = await asyncio.wait_for(
+                    server.session.call_tool(auth_probe["tool"], auth_probe["arguments"]), timeout=connect_timeout)
+                if getattr(result, "is_error", False):
+                    raise RuntimeError("auth_probe protected read failed")
+                if not getattr(server, "_auth_probe_authenticated", False):
+                    raise RuntimeError("auth_probe response lacked authenticated transport evidence")
             for t in server._tools:
                 desc = getattr(t, "description", "") or ""
                 if len(desc) > 80:
@@ -509,6 +572,10 @@ def _probe_single_server(
                         details["resources"] = len((await server.session.list_resources()).resources)
                     except Exception:
                         pass
+        except Exception:
+            if details is not None and auth_probe is not None:
+                details["initialized"] = False
+            raise
         finally:
             await server.shutdown()
 
@@ -930,8 +997,10 @@ def _reauth_oauth_server(name: str, server_config: dict, *, flow: str | None = N
             asyncio.run(login_device(name, url, oauth_cfg))
         probe_config = {**server_config, "oauth": {**oauth_cfg, "flow": selected_flow}}
         with force_interactive_oauth():
+            auth_probe = oauth_cfg.get("auth_probe")
             tools = _probe_single_server(
-                name, probe_config, connect_timeout=login_connect_timeout(probe_config)
+                name, probe_config, connect_timeout=login_connect_timeout(probe_config),
+                **({"auth_probe": auth_probe} if auth_probe is not None else {}),
             )
         # A clean probe is NOT proof of authentication: some servers (e.g. Google Drive) serve
         # initialize + tools/list without auth, so the flow may have failed (e.g. DCR 400 for

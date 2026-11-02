@@ -146,6 +146,8 @@ def _connect_inputs(server_name: str, config: dict) -> tuple[list, set]:
     before the identity header is merged in, for the strict-redirect boundary."""
     if "url" in config:
         url, headers = _http_endpoint(server_name, config)
+        if config.get("_auth_probe_anonymous"):
+            return [url, {}], set()
         configured_header_names = {key.lower() for key in headers}
         return [url, _apply_identity_header(server_name, config, headers)], configured_header_names
     return list(_stdio_launch(config)), set()
@@ -561,11 +563,12 @@ class MCPServerTransportMixin:
 
     def _streamable_http_transport(self, url: str, headers: dict, connect_timeout: float,
                                    ssl_verify, client_cert, oauth_auth,
-                                   strict_cfg_headers: bool, configured_header_names: set):
+                                   strict_cfg_headers: bool, configured_header_names: set, no_redirect: bool = False,
+                                   auth_probe: dict | None = None):
         """Streamable HTTP context manager: mcp >= 1.24.0 gets a caller-owned httpx client; on the
         deprecated API (mcp < 1.24.0) the SDK owns the client."""
         if not _core._MCP_NEW_HTTP:
-            if strict_cfg_headers:  # fail closed: without an owned client redirects can't be hooked
+            if strict_cfg_headers or no_redirect:  # fail closed when redirects cannot be controlled
                 raise ImportError(f"MCP server '{self.name}' requires mcp >= 1.24.0 to "
                                   "enforce the portable redirect-header boundary "
                                   "(strict_redirect_headers). Upgrade the mcp package.")
@@ -579,9 +582,35 @@ class MCPServerTransportMixin:
         # verify/cert live on the inner transport: a custom transport= makes client-level TLS kwargs
         # inert — and suppresses httpx's own proxy auto-detection, hence the explicit mounts=.
         inner_transport = httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
-        client_kwargs: dict = {"follow_redirects": True, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
+        async def _record_auth_probe(response):
+            # Record only a boolean, never credentials or response content.
+            import json
+            try:
+                req = response.request
+                payload = json.loads(req.content)
+                params = payload.get("params", {})
+                matching_call = (req.method == "POST" and str(req.url) == url
+                                 and payload.get("method") == "tools/call"
+                                 and params.get("name") == auth_probe["tool"]
+                                 and params.get("arguments", {}) == auth_probe["arguments"])
+                authorization = req.headers.get("authorization", "")
+                if matching_call and response.status_code == 200 and authorization.lower().startswith("bearer "):
+                    self._auth_probe_authenticated = True
+                if (matching_call and response.status_code == 401 and not authorization
+                        and response.headers.get("www-authenticate", "").lower().startswith("bearer")):
+                    self._auth_probe_challenged = True
+            except (ValueError, TypeError, AttributeError, KeyError):
+                return
+
+        response_hooks = [_make_http_rejection_recorder(self._http_rejection)]
+        if auth_probe is not None:
+            self._auth_probe_authenticated = False
+            self._auth_probe_challenged = False
+            self._auth_probe_effective_url = url
+            response_hooks.append(_record_auth_probe)
+        client_kwargs: dict = {"follow_redirects": not no_redirect, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                                **({"headers": headers} if headers else {}),
-                               "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection)]},
+                               "event_hooks": {"response": response_hooks},
                                "transport": _make_mcp_body_cap_transport(httpx, inner_transport),
                                **_present(mounts=_mcp_proxy_mounts(httpx, url, ssl_verify, client_cert, self.name),
                                           auth=oauth_auth)}
@@ -611,6 +640,23 @@ class MCPServerTransportMixin:
         # publish another endpoint's identity alongside this session.
         self._resolved_identity = _registration._identity_digest(inputs)
         url, headers = inputs
+        if config.get("_auth_probe_no_redirect"):
+            if not config.get("_auth_probe_anonymous") and headers:
+                raise ValueError("auth_probe refuses externally supplied request headers")
+            from urllib.parse import urlsplit
+            target = urlsplit(url)
+            approved = urlsplit(str(config["_auth_probe_spec"]["origin"]))
+            try:
+                valid = (target.scheme == approved.scheme == "https" and target.hostname and approved.hostname
+                         and target.username is None and target.password is None
+                         and (target.hostname, target.port or 443) == (approved.hostname, approved.port or 443))
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("auth_probe resolved endpoint differs from approved HTTPS origin")
+            expected_url = config.get("_auth_probe_expected_url")
+            if expected_url is not None and url != expected_url:
+                raise ValueError("auth_probe resolved endpoint changed after anonymous control")
         logger.debug("MCP server '%s': connecting to %s", self.name, url)
         self._http_rejection = {}  # last 4xx/5xx the owned client saw this attempt (recorder hook)
         # Seed MCP-Protocol-Version (user override wins) from the HANDSHAKE version, not the latest: a
@@ -620,6 +666,9 @@ class MCPServerTransportMixin:
         connect_timeout = config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)
         common = (url, headers, connect_timeout, config.get("ssl_verify", True), _resolve_client_cert(self.name, config),
                   self._build_oauth_auth(url, config), bool(config.get("strict_redirect_headers")))
+        no_redirect = bool(config.get("_auth_probe_no_redirect"))
+        if no_redirect and (config.get("transport") == "sse" or self._sse_fallback):
+            raise ValueError("auth_probe requires streamable HTTP without redirects")
         if config.get("transport") == "sse":
             return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
         if self._sse_fallback:
@@ -627,7 +676,7 @@ class MCPServerTransportMixin:
             # HTTP attempt on reconnects instead of flapping into the retry budget.
             logger.info("MCP server '%s': using latched SSE fallback transport", self.name)
             return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
-        transport = self._streamable_http_transport(*common, configured_header_names)
+        transport = self._streamable_http_transport(*common, configured_header_names, no_redirect, config.get("_auth_probe_spec"))
         label = "HTTP" if _core._MCP_NEW_HTTP else "legacy HTTP"
         try:
             return await self._serve_transport(transport, label, float(connect_timeout))
@@ -644,7 +693,7 @@ class MCPServerTransportMixin:
             # transport must not silently switch transports), never on a timeout (not a
             # transport mismatch — ``_is_streamable_http_rejection`` matches neither), and never
             # with ``strict_redirect_headers`` (SSE cannot enforce that boundary).
-            if (self._ever_connected or common[-1] or not _is_streamable_http_rejection(exc)):
+            if (self._ever_connected or common[-1] or no_redirect or not _is_streamable_http_rejection(exc)):
                 if http_detail != str(_unwrap_exception_group(exc)):  # opaque SDK error + a recorded rejection
                     raise ConnectionError(f"MCP server '{self.name}': Streamable HTTP connect failed "
                                           f"({http_detail})") from exc
