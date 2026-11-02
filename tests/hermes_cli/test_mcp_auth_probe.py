@@ -322,3 +322,43 @@ async def test_probe_rejects_live_bearer_before_oauth(monkeypatch):
     with pytest.raises(ValueError, match='externally supplied request headers'):
         await server._run_http(config)
     build_oauth.assert_not_called()
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_tui_and_card_worker_uses_probe_and_rolls_back_failed_consent(monkeypatch, tmp_path, failed):
+    from unittest.mock import MagicMock
+    from hermes_cli import mcp_config as mc
+    from tools.connectors import mcp_oauth as worker
+    import tools.mcp_oauth as oauth
+    import tools.mcp_oauth_manager as manager_module
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    storage = MagicMock()
+    manager = MagicMock()
+    monkeypatch.setattr(oauth, 'HermesTokenStorage', lambda name: storage)
+    monkeypatch.setattr(manager_module, 'get_manager', lambda: manager)
+    monkeypatch.setattr(mc, '_oauth_tokens_present', lambda name: True)
+    probe = {'tool': 'read', 'arguments': {}, 'origin': 'https://example.invalid'}
+    seen = []
+    def fake_probe(name, cfg, *, details, auth_probe, **kwargs):
+        seen.append(auth_probe)
+        if failed:
+            raise RuntimeError('consent denied')
+        details['initialized'] = True
+        return [('read', '')]
+    monkeypatch.setattr(mc, '_probe_single_server', fake_probe)
+    commit = MagicMock()
+    monkeypatch.setattr(worker, '_commit', commit)
+    flow = MagicMock()
+    flow.inherited_backup = None
+    config = {'url': 'https://example.invalid/mcp', 'auth': 'oauth', 'oauth': {'auth_probe': probe}}
+    if failed:
+        with pytest.raises(RuntimeError, match='consent denied'):
+            worker.probe_with_rollback('fixture', config, str(tmp_path), flow, False)
+        storage.restore.assert_called_once()
+        flow.mark_approved.assert_not_called()
+        commit.assert_not_called()
+    else:
+        worker.probe_with_rollback('fixture', config, str(tmp_path), flow, False)
+        commit.assert_called_once()
+        flow.mark_approved.assert_called_once()
+    assert seen == [probe]
