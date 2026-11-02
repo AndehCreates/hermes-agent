@@ -312,7 +312,7 @@ class MCPServerRunMixin:
         was started with, so a ``url`` edited while the process runs (dashboard/Desktop re-auth, a
         catalog migration) left the loop probing the OLD URL — and that stale-URL provider evicted the
         fresh one the dashboard had just authorised for the new URL, dropping its tokens/DCR client."""
-        if not self._is_http():
+        if not self._is_http() or config.get("_auth_probe_no_redirect"):
             return config
         from tools import mcp_tool_config as _config
         fresh = (_config._load_mcp_config() or {}).get(self.name)

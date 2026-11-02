@@ -139,8 +139,10 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
                 previous_entry = None
                 try:
                     previous_entry = manager.remove(flow.server_name, hermes_home=flow.hermes_home)
+                    auth_probe = (cfg.get("oauth") or {}).get("auth_probe")
                     tools = _probe_single_server(
-                        flow.server_name, cfg, connect_timeout=login_connect_timeout(cfg)
+                        flow.server_name, cfg, connect_timeout=login_connect_timeout(cfg),
+                        **({"auth_probe": auth_probe} if auth_probe is not None else {}),
                     )
                     if not _oauth_tokens_present(flow.server_name):
                         raise RuntimeError(

@@ -53,8 +53,10 @@ def probe_with_rollback(
 
     try:
         previous_entry = manager.remove(server_name, hermes_home=hermes_home)
+        auth_probe = (cfg.get("oauth") or {}).get("auth_probe")
         tools = _probe_single_server(
-            server_name, cfg, connect_timeout=login_connect_timeout(cfg), details=details)
+            server_name, cfg, connect_timeout=login_connect_timeout(cfg), details=details,
+            **({"auth_probe": auth_probe} if auth_probe is not None else {}))
         if not _oauth_tokens_present(server_name):
             details["initialized"] = False
             no_token = RuntimeError(
@@ -135,7 +137,9 @@ def _reuse_saved_authorization(
         return False
     try:
         with suppress_interactive_oauth():
-            tools = _probe_single_server(server_name, cfg, connect_timeout=30)
+            auth_probe = (cfg.get("oauth") or {}).get("auth_probe")
+            tools = _probe_single_server(server_name, cfg, connect_timeout=30,
+                                         **({"auth_probe": auth_probe} if auth_probe is not None else {}))
         _commit(server_name, cfg, on_commit, flow)
     except Exception as exc:
         logger.debug("saved authorization for %s was not usable: %s", server_name, exc)
