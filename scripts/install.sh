@@ -74,6 +74,7 @@ SKIP_COMPUTER_USE=false
 NO_SKILLS=false
 BRANCH="main"
 INSTALL_COMMIT=""
+RUNTIME_PYTHON=""
 FORCE_COMMIT=false
 ENSURE_DEPS=""
 
@@ -121,6 +122,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --commit|-Commit)
             INSTALL_COMMIT="$2"
+            shift 2
+            ;;
+        --runtime-python)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "--runtime-python requires an absolute executable path" >&2
+                exit 2
+            fi
+            RUNTIME_PYTHON="$2"
             shift 2
             ;;
         --force-commit|-ForceCommit)
@@ -180,6 +189,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --force-commit Apply --commit even if it rolls the install backwards"
             echo "  --manifest     Print desktop bootstrap stage manifest as JSON"
             echo "  --stage NAME   Run one desktop bootstrap stage"
+            echo "  --runtime-python PATH  Use existing Python for --stage path only"
+            echo "                   Selects source launchers without changing that runtime"
             echo "  --json         Print a JSON result frame for --stage"
             echo "  --non-interactive  Skip stages that require user input"
             echo "  --include-desktop  Also build the desktop app (apps/desktop -> Hermes.app)"
@@ -1828,7 +1839,40 @@ PY
 setup_path() {
     log_info "Setting up hermes command..."
 
-    if [ "$USE_VENV" = true ]; then
+    if [ -n "${RUNTIME_PYTHON:-}" ]; then
+        # This stage selects source and an existing runtime; it never installs
+        # dependencies into the supplied interpreter's environment.
+        case "$RUNTIME_PYTHON" in
+            /*) ;;
+            *) log_error "--runtime-python must be an absolute path"; return 2 ;;
+        esac
+        case "$RUNTIME_PYTHON" in
+            *$'\n'*|*$'\r'*)
+                log_error "--runtime-python must not contain line breaks"
+                return 2
+                ;;
+        esac
+        if [ ! -f "$RUNTIME_PYTHON" ] || [ ! -x "$RUNTIME_PYTHON" ]; then
+            log_error "--runtime-python must name an executable file"
+            return 2
+        fi
+        if [ ! -f "$INSTALL_DIR/hermes" ] || [ ! -f "$INSTALL_DIR/run_agent.py" ]; then
+            log_error "Source entrypoints are missing from the selected install directory"
+            return 2
+        fi
+        local runtime_identity
+        if ! runtime_identity="$("$RUNTIME_PYTHON" -I -S -B -c \
+            'import sys; print("hermes-runtime-python/v1"); raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null)"; then
+            log_error "--runtime-python must run Python 3.10 or newer"
+            return 2
+        fi
+        if [ "$runtime_identity" != "hermes-runtime-python/v1" ]; then
+            log_error "--runtime-python did not return a valid Python identity"
+            return 2
+        fi
+        HERMES_BIN="$RUNTIME_PYTHON"
+        HERMES_ENTRYPOINT="$INSTALL_DIR/hermes"
+    elif [ "$USE_VENV" = true ]; then
         HERMES_BIN="$INSTALL_DIR/venv/bin/python"
         HERMES_ENTRYPOINT="$INSTALL_DIR/hermes"
     else
@@ -1864,7 +1908,10 @@ setup_path() {
     # the rm, `cat >` follows the symlink and overwrites the venv pip entry
     # point with this shim — making `exec "$HERMES_BIN"` self-recurse. (#21454)
     rm -f "$command_link_dir/hermes"
-    if [ "$USE_VENV" = true ]; then
+    if [ -n "${RUNTIME_PYTHON:-}" ]; then
+        printf '#!/usr/bin/env bash\nunset PYTHONPATH\nunset PYTHONHOME\nexec %q %q "$@"\n' \
+            "$HERMES_BIN" "$HERMES_ENTRYPOINT" > "$command_link_dir/hermes"
+    elif [ "$USE_VENV" = true ]; then
         # uv-generated console scripts resolve themselves through `realpath`,
         # which stock macOS does not provide. Run the checked-in entrypoint
         # with the venv interpreter instead, so the public launcher remains
@@ -1891,7 +1938,10 @@ EOF
     # the login-shell PATH. Without this launcher users can't invoke the agent
     # entrypoint directly from outside the venv. (#74819)
     rm -f "$command_link_dir/hermes-agent"
-    if [ "$USE_VENV" = true ]; then
+    if [ -n "${RUNTIME_PYTHON:-}" ]; then
+        printf '#!/usr/bin/env bash\nunset PYTHONPATH\nunset PYTHONHOME\nexec %q %q "$@"\n' \
+            "$HERMES_BIN" "$INSTALL_DIR/run_agent.py" > "$command_link_dir/hermes-agent"
+    elif [ "$USE_VENV" = true ]; then
         cat > "$command_link_dir/hermes-agent" <<EOF
 #!/usr/bin/env bash
 unset PYTHONPATH
@@ -1916,7 +1966,10 @@ EOF
     # here too: clear the path first so `cat >` cannot follow an old symlink
     # into the venv and overwrite the console script.)
     rm -f "$command_link_dir/hermes-acp"
-    if [ "$USE_VENV" = true ]; then
+    if [ -n "${RUNTIME_PYTHON:-}" ]; then
+        printf '#!/usr/bin/env bash\nunset PYTHONPATH\nunset PYTHONHOME\nexec %q %q acp "$@"\n' \
+            "$HERMES_BIN" "$HERMES_ENTRYPOINT" > "$command_link_dir/hermes-acp"
+    elif [ "$USE_VENV" = true ]; then
         cat > "$command_link_dir/hermes-acp" <<EOF
 #!/usr/bin/env bash
 unset PYTHONPATH
@@ -3627,6 +3680,17 @@ main() {
     # See detect_install_method().
     echo "git" > "$INSTALL_DIR/.install_method"
 }
+
+if [ -n "$RUNTIME_PYTHON" ] && {
+    [ "$STAGE_NAME" != path ] || [ "$USE_VENV" != true ] ||
+    [ "$MANIFEST_MODE" = true ] || [ -n "$ENSURE_DEPS" ];
+}; then
+    log_error "--runtime-python is only supported by --stage path without --no-venv, --manifest or --ensure"
+    if [ "$JSON_OUTPUT" = true ]; then
+        emit_stage_json "$STAGE_NAME" false false "invalid --runtime-python stage combination"
+    fi
+    exit 2
+fi
 
 if [ "$MANIFEST_MODE" = true ]; then
     emit_manifest

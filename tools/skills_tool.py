@@ -670,7 +670,7 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _find_skill_catalog(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
@@ -679,7 +679,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
             filters out disabled skills.
 
     Returns:
-        List of skill metadata dicts (name, description, category).
+        Resolved physical entries with policy identities and visibility. Hidden
+        copies remain available to settings policy transitions; the public
+        catalog projection below advertises only loadable entries.
 
     Results are cached per-session; the cache is invalidated when the scan
     signature changes (dir/category mtimes or the disabled-set) and expires
@@ -690,6 +692,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         get_project_skills_dirs,
         iter_project_skill_files,
         iter_skill_index_files,
+        resolve_skill_identifiers,
     )
 
     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
@@ -701,7 +704,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
     # SKILLS_DIR can be stale in long-lived runtimes). Trusted project-local
-    # dirs come FIRST: first-wins dedup below gives them precedence over
+    # dirs come FIRST: the loader's project tier gives them precedence over
     # same-named local/external skills.
     project_dirs = list(get_project_skills_dirs())
     dirs_to_scan: list = list(project_dirs)
@@ -724,10 +727,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         # out the cached objects would poison the cache for everyone else.
         return [dict(s) for s in cached[2]]
 
-    skills = []
-    seen_names: set = set()
+    discovered = []
 
-    # Scan project dirs first, then local, then external (first-wins) —
+    # Scan every candidate before choosing loadable identifiers —
     # dirs_to_scan already resolved above for the signature. Project dirs
     # iterate through the quarantine chokepoint (scan-time injection gate).
     for scan_dir in dirs_to_scan:
@@ -747,17 +749,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
                 frontmatter, body = _parse_frontmatter(content)
 
-                if not skill_matches_platform(frontmatter):
-                    continue
-
-                if not skill_matches_environment(frontmatter):
-                    continue
-
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
-                if name in seen_names:
-                    continue
-                if name in disabled:
-                    continue
 
                 description = frontmatter.get("description", "")
                 if not description:
@@ -772,11 +764,15 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
                 category = _get_category_from_path(skill_md)
 
-                seen_names.add(name)
-                skills.append({
+                discovered.append({
                     "name": name,
                     "description": description,
                     "category": category,
+                    "directory_name": skill_dir.name,
+                    "relative_path": skill_dir.relative_to(scan_dir).as_posix(),
+                    "path": skill_md,
+                    "visible": (skill_matches_platform(frontmatter)
+                                and skill_matches_environment(frontmatter)),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -788,12 +784,32 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 )
                 continue
 
-    # Store in cache keyed by the scan signature computed BEFORE the scan
-    # (a write racing the scan changes the signature, so the next call
-    # re-scans rather than serving the torn result past the TTL). Same
-    # shallow-copy contract as the hit path — the caller may mutate.
-    _SKILLS_CACHE[cache_key] = (signature, now, skills)
-    return [dict(s) for s in skills]
+    resolved = resolve_skill_identifiers(
+        discovered, roots=dirs_to_scan, project_dirs=project_dirs
+    )
+    for entry in resolved:
+        entry["disabled"] = not disabled.isdisjoint(entry["disable_identifiers"])
+
+    # Keep the complete immutable policy identities in the existing cache.
+    # Public rows are projected afterward; settings must retain hidden copies
+    # when an explicit per-copy change replaces a legacy all-copy policy.
+    _SKILLS_CACHE[cache_key] = (signature, now, resolved)
+    return [dict(entry) for entry in resolved]
+
+
+def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+    """Return loadable public rows, or all enabled/disabled rows for settings."""
+    skills = []
+    seen_load_names = set()
+    for entry in _find_skill_catalog(skip_disabled=skip_disabled):
+        load_name = entry["load_name"]
+        if (not entry["visible"] or entry["disabled"] or not load_name
+                or load_name in seen_load_names):
+            continue
+        seen_load_names.add(load_name)
+        skills.append({"name": load_name, "description": entry["description"],
+                       "category": entry["category"]})
+    return skills
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1486,9 +1502,12 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Check if the skill is disabled by the user
+        # Resolve policy from the selected file, so another lookup spelling
+        # cannot bypass a qualified disable saved by the settings UI.
+        from agent.skill_utils import skill_disable_identifiers
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
-        if _is_skill_disabled(resolved_name):
+        policy_names = skill_disable_identifiers(resolved_name, skill_md, all_dirs)
+        if any(_is_skill_disabled(identifier) for identifier in policy_names):
             return json.dumps(
                 {
                     "success": False,

@@ -41,6 +41,56 @@ def _normalize_skill_names(values) -> Set[str]:
         return set()
 
 
+def _skill_policy_catalog() -> List[dict]:
+    # Explicit all-candidate discovery avoids recursion through policy reads.
+    from tools.skills_tool import _find_skill_catalog
+    return _find_skill_catalog(skip_disabled=True)
+
+
+def _display_disabled_skills(disabled: Set[str], entries: List[dict]) -> Set[str]:
+    """Project raw policy onto displayed load identifiers without writing it."""
+    displayed, matched = set(), set()
+    for entry in entries:
+        if not entry["visible"] or entry["shadowed"] or not entry["load_name"]:
+            continue
+        affected = disabled.intersection(entry["disable_identifiers"])
+        if affected:
+            matched.update(affected)
+            displayed.add(entry["load_name"])
+    return (disabled - matched) | displayed
+
+
+def _preserve_disabled_policy(previous: Set[str], requested: Set[str], entries: List[dict]) -> Set[str]:
+    """Retain broad legacy keys unless the user explicitly enables a copy."""
+    policy = set(requested)
+    for identifier in previous - requested:
+        affected = [e for e in entries if identifier in e["disable_identifiers"]]
+        shown = [e for e in affected if e["visible"] and not e["shadowed"] and e["load_name"]]
+        shown_names = {e["load_name"] for e in shown}
+        if not shown_names:
+            if affected:
+                policy.add(identifier)
+            continue
+        if shown_names <= requested:
+            # An unrelated edit must not narrow a legacy all-copy policy.
+            policy.add(identifier)
+            policy.difference_update(shown_names - previous)
+        else:
+            # The user enabled at least one displayed copy. Keep all remaining
+            # denials, including incompatible or shadowed existing copies.
+            exclusions = {
+                entry["relative_path"] for entry in affected
+                if entry not in shown or entry["load_name"] in requested
+            }
+            enabled = [entry for entry in shown if entry["load_name"] not in requested]
+            if any(exclusions.intersection(entry["disable_identifiers"]) for entry in enabled):
+                raise ValueError(
+                    "Skill copies cannot be enabled separately with their current paths."
+                )
+            policy.update(exclusions)
+    return policy
+
+
 def get_disabled_skills(config: dict, platform: Optional[str] = None) -> Set[str]:
     """Return disabled skill names: the global list unioned with the
     platform-specific list when a platform is given.
@@ -52,23 +102,26 @@ def get_disabled_skills(config: dict, platform: Optional[str] = None) -> Set[str
     skills_cfg = config.get("skills") or {}
     if not isinstance(skills_cfg, dict):
         return set()
-    global_disabled = _normalize_skill_names(skills_cfg.get("disabled"))
-    if platform is None:
-        return global_disabled
-    platform_disabled = cfg_get(skills_cfg, "platform_disabled", platform)
-    if platform_disabled is None:
-        return global_disabled
-    return global_disabled | _normalize_skill_names(platform_disabled)
+    disabled = _normalize_skill_names(skills_cfg.get("disabled"))
+    if platform is not None:
+        disabled |= _normalize_skill_names(cfg_get(skills_cfg, "platform_disabled", platform))
+    return _display_disabled_skills(disabled, _skill_policy_catalog())
 
 
 def save_disabled_skills(config: dict, disabled: Set[str], platform: Optional[str] = None):
-    """Persist disabled skill names to config."""
+    """Persist an explicit selection while preserving unchanged legacy policy."""
+    skills_cfg = config.get("skills") or {}
+    previous = _normalize_skill_names(
+        skills_cfg.get("disabled") if platform is None
+        else cfg_get(skills_cfg, "platform_disabled", platform)
+    )
+    policy = _preserve_disabled_policy(previous, disabled, _skill_policy_catalog())
     config.setdefault("skills", {})
     if platform is None:
-        config["skills"]["disabled"] = sorted(disabled)
+        config["skills"]["disabled"] = sorted(policy)
     else:
         config["skills"].setdefault("platform_disabled", {})
-        config["skills"]["platform_disabled"][platform] = sorted(disabled)
+        config["skills"]["platform_disabled"][platform] = sorted(policy)
     save_config(config)
 
 
