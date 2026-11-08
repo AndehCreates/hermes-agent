@@ -1593,7 +1593,7 @@ _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
 # org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+_SKILLS_SNAPSHOT_VERSION = 3  # exact relative load paths are part of the snapshot
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1726,6 +1726,7 @@ def _build_snapshot_entry(
         "skill_name": skill_name,
         "category": category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
+        "relative_path": rel_path.parent.as_posix(),
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
@@ -1843,7 +1844,8 @@ def build_skills_system_prompt(
     External skill directories (``skills.external_dirs`` in config.yaml) are
     scanned alongside the local ``~/.hermes/skills/`` directory.  External dirs
     are read-only — they appear in the index but new skills are always created
-    in the local dir.  Local skills take precedence when names collide.
+    in the local dir. Trusted projects retain their precedence; other duplicate
+    names use an exact loadable relative path, or are omitted when ambiguous.
 
     ``compact_categories`` (e.g. from the coding posture — see
     agent/coding_context.py) demotes whole categories to a names-only line in
@@ -1923,201 +1925,113 @@ def _build_skills_system_prompt_inner(
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}
-    # Unified visible-entry list (both paths) so the org labeling +
-    # fail-loud collision pass below runs identically for snapshot and scan.
-    visible_entries: list[dict] = []
     skill_entries: list[dict] = []
+    candidates: list[dict] = []
+    from agent.skill_utils import iter_project_skill_files, resolve_skill_identifiers
+
+    def collect(entry, root, compatible, *, project=False):
+        name = entry.get("frontmatter_name") or entry.get("skill_name") or ""
+        relative = entry["relative_path"]
+        candidates.append({
+            **entry, "name": name,
+            "directory_name": entry.get("skill_name") or "",
+            "relative_path": relative,
+            "path": root / relative / "SKILL.md",
+            "project": project,
+            "visible": (
+                compatible and name not in disabled
+                and entry.get("skill_name") not in disabled
+                and _skill_should_show(entry.get("conditions") or {},
+                                       available_tools, available_toolsets)
+            ),
+        })
 
     if snapshot is not None:
-        # Fast path: use pre-parsed metadata from disk
         for entry in snapshot.get("skills", []):
-            if not isinstance(entry, dict):
-                continue
-            skill_name = entry.get("skill_name") or ""
-            frontmatter_name = entry.get("frontmatter_name") or skill_name
-            platforms = entry.get("platforms") or []
-            if not skill_matches_platform_list(platforms):
-                continue
-            if frontmatter_name in disabled or skill_name in disabled:
-                continue
-            if not _skill_should_show(
-                entry.get("conditions") or {},
-                available_tools,
-                available_toolsets,
-            ):
-                continue
-            visible_entries.append(entry)
+            if isinstance(entry, dict):
+                collect(entry, skills_dir,
+                        skill_matches_platform_list(entry.get("platforms") or []))
         category_descriptions = {
             str(k): str(v)
             for k, v in (snapshot.get("category_descriptions") or {}).items()
         }
     else:
-        # Cold path: full filesystem scan + write snapshot for next time
         for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
-            is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+            compatible, frontmatter, desc = _parse_skill_file(skill_file)
             entry = _build_snapshot_entry(skill_file, skills_dir, frontmatter, desc)
             skill_entries.append(entry)
-            if not is_compatible:
-                continue
-            skill_name = entry["skill_name"]
-            if entry["frontmatter_name"] in disabled or skill_name in disabled:
-                continue
-            if not _skill_should_show(
-                extract_skill_conditions(frontmatter),
-                available_tools,
-                available_toolsets,
-            ):
-                continue
-            visible_entries.append(entry)
+            collect(entry, skills_dir, compatible)
 
-    # ── Project-local skills (highest precedence) ──────────────────────
-    # Scanned before the local/org pass; names claimed here shadow same-named
-    # profile-local skills below (that's the feature — vendored repo skills
-    # win inside their repo). Each entry is tagged so the model and the user
-    # can see where it came from.
-    project_names: set[str] = set()
-    if project_dirs:
-        from agent.skill_utils import iter_project_skill_files
+    # Resolve offers together only after collecting every candidate. A hidden
+    # candidate can still make a bare lookup ambiguous in the actual loader.
+    for root in project_dirs:
+        for skill_file in iter_project_skill_files(root):
+            try:
+                compatible, frontmatter, desc = _parse_skill_file(skill_file)
+                collect(_build_snapshot_entry(skill_file, root, frontmatter, desc),
+                        root, compatible, project=True)
+            except Exception as exc:
+                logger.debug("Error reading project skill %s: %s", skill_file, exc)
+    for root in external_dirs:
+        for skill_file in iter_skill_index_files(root, "SKILL.md"):
+            try:
+                compatible, frontmatter, desc = _parse_skill_file(skill_file)
+                collect(_build_snapshot_entry(skill_file, root, frontmatter, desc),
+                        root, compatible)
+            except Exception as exc:
+                logger.debug("Error reading external skill %s: %s", skill_file, exc)
 
-        for proj_dir in project_dirs:
-            if not proj_dir.exists():
-                continue
-            for skill_file in iter_project_skill_files(proj_dir):
-                try:
-                    is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
-                    if not is_compatible:
-                        continue
-                    entry = _build_snapshot_entry(skill_file, proj_dir, frontmatter, desc)
-                    fm_name = entry["frontmatter_name"]
-                    if fm_name in project_names:
-                        continue
-                    if fm_name in disabled or entry["skill_name"] in disabled:
-                        continue
-                    if not _skill_should_show(
-                        extract_skill_conditions(frontmatter),
-                        available_tools,
-                        available_toolsets,
-                    ):
-                        continue
-                    project_names.add(fm_name)
-                    skills_by_category.setdefault(entry["category"], []).append(
-                        (fm_name, f"[project] {entry['description']}".strip())
-                    )
-                except Exception as e:
-                    logger.debug("Error reading project skill %s: %s", skill_file, e)
-
-    if project_names:
-        # Drop profile-local entries shadowed by a project skill BEFORE the
-        # org-labeling pass so collision flags don't fire on intentional
-        # project-over-local overrides.
-        visible_entries = [
-            e
-            for e in visible_entries
-            if (e.get("frontmatter_name") or e.get("skill_name") or "")
-            not in project_names
-        ]
-
-    # ── M2 org labeling + FAIL-LOUD collisions ─────────────────────────
-    # An org skill lists with an explicit provenance tag. When a personal and
-    # an org skill share a name, NEITHER silently wins: both list qualified
-    # (personal keeps the bare name is the wrong default — silent divergence
-    # from the org set; org winning silently shadows the user's own work) —
-    # so both entries carry a [name collision] flag and skill_view refuses
-    # the ambiguous bare name (its existing multi-candidate guard).
+    resolved = resolve_skill_identifiers(
+        candidates, roots=[*project_dirs, skills_dir, *external_dirs],
+        project_dirs=project_dirs,
+    )
+    visible_entries = [e for e in resolved if e["visible"] and not e["shadowed"]]
+    unloadable = sorted({e["name"] for e in visible_entries if not e["load_name"]})
     name_owners: dict[str, set[str]] = {}
     for entry in visible_entries:
-        fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
-        kind = "org" if entry.get("org_id") else "personal"
-        name_owners.setdefault(fm, set()).add(kind)
+        name_owners.setdefault(entry["name"], set()).add(
+            "org" if entry.get("org_id") else "personal"
+        )
+    seen_load_names = set()
     for entry in visible_entries:
-        fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
+        load_name = entry["load_name"]
+        if not load_name or load_name in seen_load_names:
+            continue
+        seen_load_names.add(load_name)
         desc = entry.get("description", "")
         org_id = entry.get("org_id")
-        collided = len(name_owners.get(fm, set())) > 1
         if org_id:
             author = entry.get("org_author") or ""
-            tag = f"[org-shared{': by ' + author if author else ''}]"
-            desc = f"{tag} {desc}".strip()
+            desc = f"[org-shared{': by ' + author if author else ''}] {desc}".strip()
             category = f"org:{org_id}"
         else:
             category = entry.get("category") or "general"
-        if collided:
-            desc = f"[name collision — also exists {'personally' if org_id else 'in your org'}; load via category path] {desc}".strip()
-        skills_by_category.setdefault(category, []).append((fm, desc))
+            if entry["project"]:
+                desc = f"[project] {desc}".strip()
+        if len(name_owners.get(entry["name"], set())) > 1:
+            desc = f"[name collision — load by this exact path] {desc}".strip()
+        skills_by_category.setdefault(category, []).append((load_name, desc))
 
+    for root in ([skills_dir] if snapshot is None else []) + list(external_dirs):
+        for desc_file in iter_skill_index_files(root, "DESCRIPTION.md"):
+            try:
+                fm, _ = parse_frontmatter(desc_file.read_text(encoding="utf-8"))
+                if not fm.get("description"):
+                    continue
+                rel = desc_file.relative_to(root)
+                cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
+                desc = str(fm["description"]).strip().strip("'\"")
+                if root == skills_dir:
+                    category_descriptions[cat] = desc
+                else:
+                    category_descriptions.setdefault(cat, desc)
+            except Exception as exc:
+                logger.debug("Could not read skill description %s: %s", desc_file, exc)
     if snapshot is None:
-        # (continuation of the cold path below: category descriptions + write)
-        # Read category-level DESCRIPTION.md files
-        for desc_file in iter_skill_index_files(skills_dir, "DESCRIPTION.md"):
-            try:
-                content = desc_file.read_text(encoding="utf-8")
-                fm, _ = parse_frontmatter(content)
-                cat_desc = fm.get("description")
-                if not cat_desc:
-                    continue
-                rel = desc_file.relative_to(skills_dir)
-                cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
-                category_descriptions[cat] = str(cat_desc).strip().strip("'\"")
-            except Exception as e:
-                logger.debug("Could not read skill description %s: %s", desc_file, e)
-
         _write_skills_snapshot(
-            skills_dir,
-            _build_skills_manifest(skills_dir),
-            skill_entries,
-            category_descriptions,
+            skills_dir, _build_skills_manifest(skills_dir),
+            skill_entries, category_descriptions,
         )
-
-    # ── External skill directories ─────────────────────────────────────
-    # Scan external dirs directly (no snapshot caching — they're read-only
-    # and typically small).  Local skills already in skills_by_category take
-    # precedence: we track seen names and skip duplicates from external dirs.
-    seen_skill_names: set[str] = set()
-    for cat_skills in skills_by_category.values():
-        for name, _desc in cat_skills:
-            seen_skill_names.add(name)
-
-    for ext_dir in external_dirs:
-        if not ext_dir.exists():
-            continue
-        for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
-            try:
-                is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
-                if not is_compatible:
-                    continue
-                entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
-                skill_name = entry["skill_name"]
-                frontmatter_name = entry["frontmatter_name"]
-                if frontmatter_name in seen_skill_names:
-                    continue
-                if frontmatter_name in disabled or skill_name in disabled:
-                    continue
-                if not _skill_should_show(
-                    extract_skill_conditions(frontmatter),
-                    available_tools,
-                    available_toolsets,
-                ):
-                    continue
-                seen_skill_names.add(frontmatter_name)
-                skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
-                )
-            except Exception as e:
-                logger.debug("Error reading external skill %s: %s", skill_file, e)
-
-        # External category descriptions
-        for desc_file in iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
-            try:
-                content = desc_file.read_text(encoding="utf-8")
-                fm, _ = parse_frontmatter(content)
-                cat_desc = fm.get("description")
-                if not cat_desc:
-                    continue
-                rel = desc_file.relative_to(ext_dir)
-                cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
-                category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
-            except Exception as e:
-                logger.debug("Could not read external skill description %s: %s", desc_file, e)
 
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only
@@ -2134,15 +2048,21 @@ def _build_skills_system_prompt_inner(
     )
 
     hidden_note = ""
-    if demoted:
+    if unloadable:
         hidden_note = (
+            "\n([name collision — no unique load path] A copy of "
+            + ", ".join(unloadable)
+            + " is omitted because both its name and path are ambiguous; rename one copy.)"
+        )
+    if demoted:
+        hidden_note += (
             "\n(Categories marked [names only] are outside the current coding "
             "context, so their descriptions are omitted — the skills work "
             "normally and load with skill_view(name) as usual.)"
         )
 
     if not skills_by_category:
-        result = ""
+        result = hidden_note.strip()
     else:
         index_lines = []
         for category in sorted(skills_by_category.keys()):

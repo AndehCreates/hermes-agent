@@ -29,7 +29,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from agent.skill_utils import is_excluded_skill_path
 from typing import Any, Dict, List, Optional, Tuple, Union
-from urllib.parse import unquote, urljoin, urlparse, urlsplit, urlunparse
+from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit, urlunparse
 
 import httpx
 import yaml
@@ -649,66 +649,72 @@ class GitHubSource(SkillSource):
         return results[:limit]
 
     def fetch(self, identifier: str) -> Optional[SkillBundle]:
-        """
-        Download a skill from GitHub.
-        identifier format: "owner/repo/path/to/skill-dir"
-        """
+        """Download one complete skill directory from an immutable Git tree."""
         parts = identifier.split("/", 2)
         if len(parts) < 3:
             return None
-
         repo = f"{parts[0]}/{parts[1]}"
-        skill_path = parts[2]
-
-        skill_md = self._fetch_file_content(repo, f"{skill_path.rstrip('/')}/SKILL.md")
+        skill_path = parts[2].rstrip("/")
+        # Backport of upstream 45d9c33d + 7e95b67a: enumerate the full
+        # directory, then pin every byte to the tree that admitted its path.
+        # Without a complete tree there is no complete, pinned bundle.
+        tree = self._get_repo_tree(repo)
+        revision = self._tree_revisions.get(repo)
+        if tree is None or not revision:
+            logger.warning("Cannot resolve complete pinned skill tree: %s", identifier)
+            return None
+        _, entries = tree
+        prefix = f"{skill_path}/"
+        root_entry = next(
+            (item for item in entries if item.get("path") == f"{prefix}SKILL.md"),
+            None,
+        )
+        if (root_entry is None or root_entry.get("type") != "blob"
+                or root_entry.get("mode") == "120000"):
+            return None
+        skill_md = self._fetch_file_content(repo, f"{prefix}SKILL.md", ref=revision)
         if skill_md is None:
             return None
         referenced = _referenced_support_paths(skill_md)
         if referenced is None:
             return None
-
         files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
-        tree = self._get_repo_tree(repo)
-        if tree is not None:
-            branch, entries = tree
-            prefix = f"{skill_path.rstrip('/')}/"
-            entries_by_path = {item.get("path", ""): item for item in entries}
-            for rel_path in sorted(referenced):
-                item_path = f"{prefix}{rel_path}"
-                item = entries_by_path.get(item_path)
-                if item is None:
-                    logger.warning("Referenced skill support file is missing: %s", item_path)
-                    return None
-                if item.get("type") != "blob" or item.get("mode") == "120000":
-                    logger.warning("Rejected non-regular file in skill bundle: %s", item_path)
-                    return None
-                content = self._fetch_file_bytes(repo, item_path)
-                if content is None:
-                    return None
-                files[rel_path] = content
-            revision = self._tree_revisions.get(repo) or branch
-        else:
-            for rel_path in referenced:
-                content = self._fetch_file_bytes(repo, f"{skill_path.rstrip('/')}/{rel_path}")
-                if content is None:
-                    return None
-                files[rel_path] = content
-            revision = ""
-
-        skill_name = skill_path.rstrip("/").split("/")[-1]
-        trust = self.trust_level_for(identifier)
-
+        for item in entries:
+            if item.get("type") != "blob" or item.get("mode") == "120000":
+                continue
+            item_path = item.get("path", "")
+            if not item_path.startswith(prefix):
+                continue
+            rel_path = item_path[len(prefix):]
+            if rel_path == "SKILL.md":
+                continue
+            components = rel_path.split("/")
+            if (any(part.startswith(".") or part == "__pycache__" for part in components)
+                    or rel_path.endswith(".pyc")):
+                continue
+            try:
+                rel_path = _validate_bundle_rel_path(rel_path)
+            except ValueError:
+                logger.warning("Rejected unsafe file path in skill bundle: %s", item_path)
+                return None
+            content = self._fetch_file_bytes(repo, item_path, ref=revision)
+            if content is None:
+                logger.warning("Incomplete skill bundle; missing tree blob: %s", item_path)
+                return None
+            files[rel_path] = content
+        # Preserve 41447's linked-file fence. A required symlink, unsafe
+        # path or absent support file must not turn into an installed shell.
+        if not referenced.issubset(files):
+            logger.warning("Referenced skill support files are missing: %s", sorted(referenced - files.keys()))
+            return None
         return SkillBundle(
-            name=skill_name,
+            name=skill_path.split("/")[-1],
             files=files,
             source="github",
             identifier=identifier,
-            trust_level=trust,
+            trust_level=self.trust_level_for(identifier),
             metadata={
-                "source_url": (
-                    f"https://github.com/{repo}/tree/{revision}/{skill_path}"
-                    if revision else f"https://github.com/{repo}/{skill_path}"
-                ),
+                "source_url": f"https://github.com/{repo}/tree/{revision}/{skill_path}",
                 "source_revision": revision,
             },
         )
@@ -803,22 +809,15 @@ class GitHubSource(SkillSource):
     # -- Repo tree cache (avoids redundant API calls) --
 
     def _get_repo_tree(self, repo: str) -> Optional[Tuple[str, List[dict]]]:
-        """Get cached or fresh repo tree.
+        """Resolve and cache a complete tree with its immutable commit identity.
 
-        Returns ``(default_branch, tree_entries)`` or ``None``.
-        A single install can call ``_download_directory_via_tree`` and
-        ``_find_skill_in_repo_tree`` multiple times for the same repo — this
-        cache eliminates the redundant ``GET /repos/{repo}`` +
-        ``GET /repos/{repo}/git/trees/{branch}`` round-trips (previously up to
-        6 duplicated pairs per install, consuming ~12 of the 60/hr
-        unauthenticated rate limit for nothing).
+        The Git Trees API's sha identifies a tree object, which the Contents
+        API rejects as a ref. Bind branch -> commit -> tree before fetching
+        paths, and retain the COMMIT for every subsequent content request.
         """
         if repo in self._tree_cache:
             return self._tree_cache[repo]
-
         headers = self.auth.get_headers()
-
-        # Resolve default branch
         try:
             resp = httpx.get(
                 f"https://api.github.com/repos/{repo}",
@@ -828,13 +827,28 @@ class GitHubSource(SkillSource):
                 self._check_rate_limit_response(resp)
                 return None
             default_branch = resp.json().get("default_branch", "main")
-        except (httpx.HTTPError, ValueError):
-            return None
-
-        # Fetch recursive tree
-        try:
+            if not isinstance(default_branch, str) or not default_branch:
+                return None
             resp = httpx.get(
-                f"https://api.github.com/repos/{repo}/git/trees/{default_branch}",
+                f"https://api.github.com/repos/{repo}/branches/{quote(default_branch, safe='')}",
+                headers=headers, timeout=15, follow_redirects=True,
+            )
+            if resp.status_code != 200:
+                self._check_rate_limit_response(resp)
+                return None
+            branch_data = resp.json()
+            commit = branch_data.get("commit", {}) if isinstance(branch_data, dict) else {}
+            if not isinstance(commit, dict):
+                return None
+            revision = commit.get("sha")
+            commit_data = commit.get("commit", {})
+            tree_data = commit_data.get("tree", {}) if isinstance(commit_data, dict) else {}
+            tree_revision = tree_data.get("sha") if isinstance(tree_data, dict) else None
+            if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
+                       for value in (revision, tree_revision)):
+                return None
+            resp = httpx.get(
+                f"https://api.github.com/repos/{repo}/git/trees/{tree_revision}",
                 params={"recursive": "1"},
                 headers=headers, timeout=30, follow_redirects=True,
             )
@@ -842,18 +856,17 @@ class GitHubSource(SkillSource):
                 self._check_rate_limit_response(resp)
                 return None
             tree_data = resp.json()
-            if tree_data.get("truncated"):
-                logger.debug("Git tree truncated for %s, cannot cache", repo)
+            if (not isinstance(tree_data, dict) or tree_data.get("truncated")
+                    or tree_data.get("sha") != tree_revision):
+                return None
+            entries = tree_data.get("tree")
+            if not isinstance(entries, list) or not all(isinstance(item, dict) for item in entries):
                 return None
         except (httpx.HTTPError, ValueError):
             return None
-
-        entries = tree_data.get("tree", [])
-        revision = tree_data.get("sha")
-        if isinstance(revision, str) and revision:
-            self._tree_revisions[repo] = revision
+        self._tree_revisions[repo] = revision
         self._tree_cache[repo] = (default_branch, entries)
-        return (default_branch, entries)
+        return self._tree_cache[repo]
 
     def _check_rate_limit_response(self, resp: "httpx.Response") -> None:
         """Flag the instance as rate-limited when GitHub returns 403 + exhausted quota."""
@@ -1067,9 +1080,11 @@ class GitHubSource(SkillSource):
 
         return None
 
-    def _fetch_file_content(self, repo: str, path: str) -> Optional[str]:
-        """Fetch a single text file from GitHub."""
-        content = self._fetch_file_bytes(repo, path)
+    def _fetch_file_content(
+        self, repo: str, path: str, ref: Optional[str] = None
+    ) -> Optional[str]:
+        """Fetch text at the same revision as its admitted Git tree."""
+        content = self._fetch_file_bytes(repo, path, ref=ref)
         if content is None:
             return None
         try:
@@ -1077,11 +1092,14 @@ class GitHubSource(SkillSource):
         except UnicodeDecodeError:
             return None
 
-    def _fetch_file_bytes(self, repo: str, path: str) -> Optional[bytes]:
-        """Fetch exact file bytes from GitHub without text decoding."""
-        url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    def _fetch_file_bytes(
+        self, repo: str, path: str, ref: Optional[str] = None
+    ) -> Optional[bytes]:
+        """Fetch exact bytes; installs pass the resolved immutable tree SHA."""
+        url = f"https://api.github.com/repos/{repo}/contents/{quote(path, safe='/')}"
         resp = self._github_get(
             url,
+            params={"ref": ref} if ref else None,
             headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"},
         )
         if resp is not None and resp.status_code == 200:

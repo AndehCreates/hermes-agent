@@ -79,8 +79,8 @@ class TestExternalSkillsInFindAll:
         names = [s["name"] for s in skills]
         assert "my-external-skill" in names
 
-    def test_local_takes_precedence(self, hermes_home, external_skills_dir):
-        """If the same skill name exists locally and externally, local wins."""
+    def test_same_path_collision_is_not_advertised(self, hermes_home, external_skills_dir):
+        """The catalog must not promise a name that the unchanged loader refuses."""
         local_skills = hermes_home / "skills"
         local_skill = local_skills / "my-external-skill"
         local_skill.mkdir(parents=True)
@@ -96,9 +96,11 @@ class TestExternalSkillsInFindAll:
         ):
             from tools.skills_tool import _find_all_skills
             skills = _find_all_skills()
-        matching = [s for s in skills if s["name"] == "my-external-skill"]
-        assert len(matching) == 1
-        assert matching[0]["description"] == "Local version"
+            from tools.skills_tool import skill_view
+            loaded = json.loads(skill_view("my-external-skill"))
+        assert skills == []
+        assert loaded["success"] is False
+        assert len(loaded["matches"]) == 2
 
 
 class TestExternalSkillView:

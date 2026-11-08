@@ -36,6 +36,11 @@ from tools.skills_hub import (
 # ---------------------------------------------------------------------------
 
 
+def _branch_metadata():
+    # Native GitHub branch responses distinguish the commit from its tree.
+    return {"commit": {"sha": "b" * 40, "commit": {"tree": {"sha": "c" * 40}}}}
+
+
 class TestParseFrontmatterQuick:
     def test_valid_frontmatter_including_nested_yaml(self):
         content = "---\nname: test-skill\ndescription: A test.\n---\n\n# Body\n"
@@ -221,9 +226,13 @@ class TestSkillsShSource:
                 resp.status_code = 200
                 resp.json = lambda: {"default_branch": "main"}
                 return resp
-            if "/git/trees/main" in url:
+            if "/branches/main" in url:
                 resp.status_code = 200
-                resp.json = lambda: {"tree": tree_entries}
+                resp.json = _branch_metadata
+                return resp
+            if url.endswith("/git/trees/" + "c" * 40):
+                resp.status_code = 200
+                resp.json = lambda: {"sha": "c" * 40, "tree": tree_entries}
                 return resp
             # skills.sh detail page
             resp.status_code = 200
@@ -270,9 +279,12 @@ class TestFindSkillInRepoTree:
             if url.endswith("/davila7/claude-code-templates"):
                 resp.status_code = 200
                 resp.json = lambda: {"default_branch": "main"}
-            elif "/git/trees/main" in url:
+            elif "/branches/main" in url:
                 resp.status_code = 200
-                resp.json = lambda: {"tree": tree_entries}
+                resp.json = _branch_metadata
+            elif url.endswith("/git/trees/" + "c" * 40):
+                resp.status_code = 200
+                resp.json = lambda: {"sha": "c" * 40, "tree": tree_entries}
             else:
                 resp.status_code = 404
             return resp
@@ -1079,8 +1091,10 @@ class TestDownloadDirectoryViaTree:
     def test_tree_api_downloads_subdirectories(self, mock_get, mock_fetch):
         """Tree API returns files from nested subdirectories."""
         repo_resp = MagicMock(status_code=200, json=lambda: {"default_branch": "main"})
+        branch_resp = MagicMock(status_code=200, json=_branch_metadata)
         tree_resp = MagicMock(status_code=200, json=lambda: {
             "truncated": False,
+            "sha": "c" * 40,
             "tree": [
                 {"type": "blob", "path": "skills/my-skill/SKILL.md"},
                 {"type": "blob", "path": "skills/my-skill/scripts/run.py"},
@@ -1089,7 +1103,7 @@ class TestDownloadDirectoryViaTree:
                 {"type": "blob", "path": "other/file.txt"},
             ],
         })
-        mock_get.side_effect = [repo_resp, tree_resp]
+        mock_get.side_effect = [repo_resp, branch_resp, tree_resp]
         mock_fetch.side_effect = lambda repo, path: f"content-of-{path}"
 
         src = self._source()
@@ -1106,8 +1120,9 @@ class TestDownloadDirectoryViaTree:
     def test_falls_back_on_truncated_tree(self, mock_get, mock_fallback):
         """When tree is truncated, fall back to recursive Contents API."""
         repo_resp = MagicMock(status_code=200, json=lambda: {"default_branch": "main"})
+        branch_resp = MagicMock(status_code=200, json=_branch_metadata)
         tree_resp = MagicMock(status_code=200, json=lambda: {"truncated": True, "tree": []})
-        mock_get.side_effect = [repo_resp, tree_resp]
+        mock_get.side_effect = [repo_resp, branch_resp, tree_resp]
 
         src = self._source()
         files = src._download_directory("owner/repo", "skills/my-skill")

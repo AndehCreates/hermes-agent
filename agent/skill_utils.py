@@ -894,6 +894,89 @@ def iter_project_skill_files(project_dir: Path):
         yield skill_md
 
 
+def resolve_skill_identifiers(
+    entries: List[Dict[str, Any]], *, roots=(), project_dirs=()
+) -> List[Dict[str, Any]]:
+    """Resolve advertised aliases using the installed loader's ownership rules.
+
+    Backport of upstream ef3d8ba3/a24d7382. The served version only gives
+    trusted projects precedence; local/external collisions still refuse.
+    Hidden entries participate in resolution. Distinct files never collapse
+    merely because their payloads happen to match.
+    """
+    out = [dict(entry) for entry in entries]
+    projects = [Path(root).resolve() for root in project_dirs]
+    owners: Dict[str, Set[str]] = {}
+    project_owners: Dict[str, Set[str]] = {}
+
+    def identity(path):
+        try:
+            return Path(path).resolve()
+        except OSError:
+            return Path(path).absolute()
+
+    def in_project(path):
+        return any(path.is_relative_to(root) for root in projects)
+
+    def record(path, aliases):
+        resolved = identity(path)
+        key = str(resolved)
+        for alias in set(aliases):
+            if alias:
+                owners.setdefault(alias, set()).add(key)
+                if in_project(resolved):
+                    project_owners.setdefault(alias, set()).add(key)
+        return key
+
+    for entry in out:
+        entry["_identity"] = record(entry["path"], (
+            str(entry["name"]), entry["directory_name"], entry["relative_path"]
+        ))
+
+    # skill_view also considers legacy flat Markdown. They are lookup
+    # blockers, not newly advertised skills. Include path suffix aliases
+    # because its rglob("<lookup>.md") accepts categorized legacy names.
+    for root in dict.fromkeys(map(Path, roots)):
+        for path in root.rglob("*.md"):
+            if path.name == "SKILL.md" or is_skill_support_path(path):
+                continue
+            relative = path.relative_to(root).with_suffix("")
+            aliases = [Path(*relative.parts[i:]).as_posix() for i in range(len(relative.parts))]
+            record(path, aliases)
+    # Project quarantine hides offers but cannot make a lower-tier bare
+    # alias loadable: skill_view still finds that project candidate first
+    # and refuses it at its quarantine gate.
+    for root in project_dirs:
+        for path in iter_skill_index_files(Path(root), "SKILL.md"):
+            try:
+                frontmatter, _ = parse_frontmatter(path.read_text(encoding="utf-8-sig", errors="replace"))
+                record(path, (
+                    str(frontmatter.get("name", path.parent.name)),
+                    path.parent.name, path.parent.relative_to(root).as_posix(),
+                ))
+            except (OSError, ValueError):
+                continue
+
+    def winner(alias):
+        candidates = project_owners.get(alias) or owners.get(alias, set())
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
+    for entry in out:
+        key = entry.pop("_identity")
+        name, rel = str(entry["name"]), entry["relative_path"]
+        entry["shadowed"] = bool(project_owners.get(name) and key not in project_owners[name])
+        if entry["shadowed"]:
+            load_name = None
+        elif winner(name) == key:
+            load_name = name
+        elif winner(rel) == key:
+            load_name = rel
+        else:
+            load_name = None
+        entry["load_name"] = load_name
+    return out
+
+
 def normalize_skill_lookup_name(identifier: str) -> str:
     """Normalize a skill identifier to a ``skill_view()``-safe relative path.
 
