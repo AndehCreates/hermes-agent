@@ -1985,7 +1985,10 @@ def _build_skills_system_prompt_inner(
         candidates, roots=[*project_dirs, skills_dir, *external_dirs],
         project_dirs=project_dirs,
     )
-    visible_entries = [e for e in resolved if e["visible"] and not e["shadowed"]]
+    visible_entries = [
+        e for e in resolved if e["visible"] and not e["shadowed"]
+        and disabled.isdisjoint(e["disable_identifiers"])
+    ]
     unloadable = sorted({e["name"] for e in visible_entries if not e["load_name"]})
     name_owners: dict[str, set[str]] = {}
     for entry in visible_entries:

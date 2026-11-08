@@ -894,6 +894,26 @@ def iter_project_skill_files(project_dir: Path):
         yield skill_md
 
 
+def skill_disable_identifiers(name: str, skill_file: Path, roots) -> tuple[str, ...]:
+    """Policy keys for one physical skill, independent of the lookup spelling."""
+    target = skill_file.parent if skill_file.name == "SKILL.md" else skill_file.with_suffix("")
+    identifiers = {str(name)}
+    for root in map(Path, roots):
+        pairs = [(target.absolute(), root.absolute())]
+        try:
+            pairs.append((target.resolve(), root.resolve()))
+        except (OSError, RuntimeError):
+            pass
+        for candidate, base in pairs:
+            try:
+                relative = candidate.relative_to(base).as_posix()
+            except ValueError:
+                continue
+            if relative != ".":
+                identifiers.add(relative)
+    return (str(name), *sorted(identifiers - {str(name)}))
+
+
 def resolve_skill_identifiers(
     entries: List[Dict[str, Any]], *, roots=(), project_dirs=()
 ) -> List[Dict[str, Any]]:
@@ -905,6 +925,7 @@ def resolve_skill_identifiers(
     merely because their payloads happen to match.
     """
     out = [dict(entry) for entry in entries]
+    roots = tuple(map(Path, roots))
     projects = [Path(root).resolve() for root in project_dirs]
     owners: Dict[str, Set[str]] = {}
     project_owners: Dict[str, Set[str]] = {}
@@ -974,6 +995,7 @@ def resolve_skill_identifiers(
         else:
             load_name = None
         entry["load_name"] = load_name
+        entry["disable_identifiers"] = skill_disable_identifiers(name, entry["path"], roots)
     return out
 
 

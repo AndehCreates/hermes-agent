@@ -321,3 +321,192 @@ def test_branch_movement_cannot_change_the_admitted_tree(monkeypatch):
     tree = source._get_repo_tree("owner/repo")
     assert tree[1][0]["path"] == "skill/at-snapshot"
     assert source._tree_revisions["owner/repo"] == commit_id
+
+
+# Settings display identifiers and persisted disable policy share the resolver.
+def _save_alpha_disabled(c, monkeypatch, platform=None):
+    from hermes_cli import skills_config
+    rows = skills_config._list_all_skills()
+    categories = skills_config._get_categories(rows)
+    monkeypatch.setattr(
+        "hermes_cli.curses_ui.curses_checklist",
+        lambda *args, **kwargs: {categories.index("beta")},
+    )
+    config = {"skills": {}}
+    selected = skills_config._toggle_by_category(
+        rows, skills_config.get_disabled_skills(config, platform)
+    )
+    skills_config.save_disabled_skills(config, selected, platform)
+    assert selected == {"alpha/one"}
+    return config
+
+
+@pytest.mark.parametrize("surface", ["catalog", "path", "directory", "support", "prompt", "snapshot"])
+def test_settings_alias_disable_is_enforced_everywhere(catalog, monkeypatch, surface):
+    c = catalog
+    first = c.put(c.local, "alpha/one")
+    c.put(c.local, "beta/two")
+    (first.parent / "references").mkdir()
+    (first.parent / "references/example.md").write_text("private support fixture")
+    _save_alpha_disabled(c, monkeypatch)
+    if surface == "catalog":
+        assert [r["name"] for r in assert_loadable_rows(c)] == ["beta/two"]
+    elif surface in {"path", "directory", "support"}:
+        loaded = json.loads(c.tool.skill_view(
+            "one" if surface == "directory" else "alpha/one",
+            file_path="references/example.md" if surface == "support" else None,
+            preprocess=False,
+        ))
+        assert not loaded["success"] and "disabled" in loaded["error"]
+    else:
+        if surface == "snapshot":
+            c.prompt.build_skills_system_prompt()
+            c.prompt._SKILLS_PROMPT_CACHE.clear()
+        rendered = c.prompt.build_skills_system_prompt()
+        assert "alpha/one" not in rendered and "beta/two" in rendered
+    assert json.loads(c.tool.skill_view("beta/two", preprocess=False))["success"]
+
+
+def test_settings_legacy_readback_does_not_rewrite_policy(catalog):
+    from hermes_cli import skills_config
+    c = catalog
+    c.put(c.local, "alpha/one")
+    c.put(c.local, "beta/two")
+    config = {"skills": {"disabled": ["duplicate"]}}
+    skills_config.save_config(config)
+    before = (c.home / "config.yaml").read_bytes()
+    rows = skills_config._list_all_skills()
+    disabled = skills_config.get_disabled_skills(config)
+    assert {row["name"] for row in rows if row["name"] not in disabled} == set()
+    assert (c.home / "config.yaml").read_bytes() == before
+    assert config["skills"]["disabled"] == ["duplicate"]
+
+
+def test_settings_unrelated_change_retains_legacy_all_copy_policy(catalog):
+    from hermes_cli import skills_config
+    c = catalog
+    c.put(c.local, "alpha/one")
+    c.put(c.local, "beta/two")
+    c.put(c.local, "other/third", name="other")
+    config = {"skills": {"disabled": ["duplicate"]}}
+    projected = skills_config.get_disabled_skills(config)
+    skills_config.save_disabled_skills(config, projected | {"other"})
+    assert set(config["skills"]["disabled"]) == {"duplicate", "other"}
+    c.put(c.local, "future/fourth")
+    assert not json.loads(c.tool.skill_view("future/fourth", preprocess=False))["success"]
+
+
+def test_settings_enabling_one_copy_preserves_other_and_hidden_denials(catalog):
+    from hermes_cli import skills_config
+    c = catalog
+    c.put(c.local, "alpha/one")
+    c.put(c.local, "beta/two")
+    c.put(c.local, "hidden/three", extra="platforms: [unavailable-platform]\n")
+    config = {"skills": {"disabled": ["duplicate"]}}
+    projected = skills_config.get_disabled_skills(config)
+    assert {"alpha/one", "beta/two"} <= projected
+    skills_config.save_disabled_skills(config, projected - {"alpha/one"})
+    assert "duplicate" not in config["skills"]["disabled"]
+    assert json.loads(c.tool.skill_view("alpha/one", preprocess=False))["success"]
+    assert not json.loads(c.tool.skill_view("beta/two", preprocess=False))["success"]
+    c.put(c.local, "hidden/three")
+    loaded = json.loads(c.tool.skill_view("hidden/three", preprocess=False))
+    assert not loaded["success"] and "disabled" in loaded["error"]
+
+
+def test_settings_relative_disable_survives_unique_name_transition(catalog):
+    c = catalog
+    c.put(c.local, "alpha/one")
+    sibling = c.put(c.local, "beta/two")
+    (c.home / "config.yaml").write_text("skills:\n  disabled: [alpha/one]\n")
+    sibling.unlink()
+    assert c.tool._find_all_skills() == []
+    loaded = json.loads(c.tool.skill_view("duplicate", preprocess=False))
+    assert not loaded["success"] and "disabled" in loaded["error"]
+
+
+def test_settings_platform_alias_policy_keeps_global_union(catalog, monkeypatch):
+    from hermes_cli import skills_config
+    c = catalog
+    c.put(c.local, "alpha/one")
+    c.put(c.local, "beta/two")
+    config = _save_alpha_disabled(c, monkeypatch, platform="telegram")
+    monkeypatch.setenv("HERMES_PLATFORM", "telegram")
+    assert [r["name"] for r in assert_loadable_rows(c)] == ["beta/two"]
+    monkeypatch.setenv("HERMES_PLATFORM", "cli")
+    assert len(assert_loadable_rows(c)) == 2
+    config["skills"]["disabled"] = ["duplicate"]
+    skills_config.save_config(config)
+    assert c.tool._find_all_skills() == []
+    assert skills_config.get_disabled_skills(config, "cli") == {"alpha/one", "beta/two"}
+
+
+def test_settings_alias_policy_follows_live_profile(catalog, monkeypatch):
+    from hermes_cli import skills_config
+    c = catalog
+    c.put(c.local, "alpha/one")
+    c.put(c.local, "beta/two")
+    (c.home / "config.yaml").write_text("skills:\n  disabled: [alpha/one]\n")
+    assert [r["name"] for r in assert_loadable_rows(c)] == ["beta/two"]
+    second = c.home.parent / "second-profile"
+    (second / "skills").mkdir(parents=True)
+    c.put(second / "skills", "alpha/one")
+    c.put(second / "skills", "beta/two")
+    monkeypatch.setenv("HERMES_HOME", str(second))
+    assert len(assert_loadable_rows(c)) == 2
+    assert skills_config.get_disabled_skills({}) == set()
+
+
+def test_settings_disabled_project_does_not_fall_back_to_lower_tier(catalog):
+    c = catalog
+    c.roots["project"] = [c.project]
+    c.put(c.local, "local/one")
+    c.put(c.project, "project/two")
+    (c.home / "config.yaml").write_text("skills:\n  disabled: [project/two]\n")
+    assert c.tool._find_all_skills() == []
+    result = json.loads(c.tool.skill_view("duplicate", preprocess=False))
+    assert not result["success"] and "disabled" in result["error"]
+    assert "local/one" not in c.prompt.build_skills_system_prompt()
+
+
+def test_settings_enabling_project_preserves_shadowed_legacy_denial(catalog):
+    from hermes_cli import skills_config
+    c = catalog
+    c.roots["project"] = [c.project]
+    c.put(c.local, "local/one")
+    c.put(c.project, "project/two")
+    config = {"skills": {"disabled": ["duplicate"]}}
+    skills_config.save_disabled_skills(config, set())
+    assert json.loads(c.tool.skill_view("duplicate", preprocess=False))["success"]
+    local = json.loads(c.tool.skill_view("local/one", preprocess=False))
+    assert not local["success"] and "disabled" in local["error"]
+
+
+def test_settings_unrelated_change_preserves_unloadable_legacy_copies(catalog):
+    from hermes_cli import skills_config
+    c = catalog
+    c.roots["external"] = [c.external]
+    c.put(c.local, "same")
+    external = c.put(c.external, "same")
+    c.put(c.local, "other", name="other")
+    config = {"skills": {"disabled": ["duplicate"]}}
+    skills_config.save_disabled_skills(config, {"other"})
+    assert set(config["skills"]["disabled"]) == {"duplicate", "other"}
+    external.unlink()
+    loaded = json.loads(c.tool.skill_view("duplicate", preprocess=False))
+    assert not loaded["success"] and "disabled" in loaded["error"]
+
+
+def test_settings_unrepresentable_copy_enable_refuses_before_save(catalog):
+    from hermes_cli import skills_config
+    c = catalog
+    c.roots["project"] = [c.project]
+    c.put(c.local, "same")
+    c.put(c.project, "same")
+    config = {"skills": {"disabled": ["duplicate"]}}
+    skills_config.save_config(config)
+    before = (c.home / "config.yaml").read_bytes()
+    with pytest.raises(ValueError, match="cannot be enabled separately"):
+        skills_config.save_disabled_skills(config, set())
+    assert config == {"skills": {"disabled": ["duplicate"]}}
+    assert (c.home / "config.yaml").read_bytes() == before
